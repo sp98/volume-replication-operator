@@ -1,0 +1,209 @@
+name: e2e
+
+on:
+  push:
+    branches: [ '*' ]
+  pull_request:
+    branches: [ '*' ]
+
+jobs:
+
+  build:
+    runs-on: ubuntu-18.04
+    env:
+      rook-working-directory: /home/runner/go/src/github.com/rook/volume-replication-operator
+      IMG_NAME: quay.io/csiaddons/volumereplication-operator
+      IMG_TAG: test1098
+
+    steps:
+    - name: Set up Go
+      uses: actions/setup-go@v2
+      with:
+        go-version: 1.16
+
+    - name: Checkout rook master
+      uses: actions/checkout@v2
+      with:
+        repository: rook/rook
+
+    - name: copy rook-operator repo in go src
+      run: |
+        mkdir -p /home/runner/go/src/github.com/rook/
+        cp -r /home/runner/work/volume-replication-operator/volume-replication-operator /home/runner/go/src/github.com/rook/
+
+    - name: Checkout Volume Replication operator
+      uses: actions/checkout@v2
+
+    - name: copy volume-replication-operator repo in go src
+      run: |
+        mkdir -p /home/runner/go/src/github.com/csi-addons
+        cp -r /home/runner/work/volume-replication-operator/volume-replication-operator /home/runner/go/src/github.com/csi-addons
+
+    - name: build Volume Replication Image
+      working-directory: "/home/runner/go/src/github.com/csi-addons/volume-replication-operator"
+      env:
+        GOPATH: /home/runner/go
+      run: |
+        export PATH=$PATH:$GOPATH/bin
+        export VERSION="2.3.2"
+        wget https://github.com/kubernetes-sigs/kubebuilder/releases/download/v"$VERSION"/kubebuilder_"$VERSION"_linux_amd64.tar.gz
+        tar -zxvf kubebuilder_"$VERSION"_linux_amd64.tar.gz
+        export KUBEBUILDER_ASSETS="$(pwd)/kubebuilder_"$VERSION"_linux_amd64/bin"
+        make docker-build
+        # TODO: remove
+        docker images
+
+    - name: setup primary minikube cluster
+      uses: hiberbee/github-action-minikube@latest
+      with:
+        minikube-version: 'v1.21.0'
+        kubernetes-version: 'v1.19.2'
+        # TODO: check other actions as profile is not supported for none --vm-driver
+        profile: primary
+        cpus: 2
+        github token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: setup secondary minikube cluster
+      uses: hiberbee/github-action-minikube@latest
+      with:
+        minikube version: 'v1.21.0'
+        kubernetes version: 'v1.19.2'
+        profile: secondary
+        cpus: 2
+        github token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: install deps
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        ls -l
+        tests/scripts/github-action-helper.sh install_deps
+
+    - name: use local disk into two partitions
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        BLOCK=$(sudo lsblk --paths|awk '/14G/ {print $1}'| head -1)
+        BLOCK_DATA_PART=${BLOCK}1
+        sudo dmsetup version||true
+        sudo swapoff --all --verbose
+        sudo umount /mnt
+        # search for the device since it keeps changing between sda and sdb
+        sudo wipefs --all --force "$BLOCK_DATA_PART"
+        tests/scripts/create-bluestore-partitions.sh --disk "$BLOCK" --osd-count 2
+        sudo lsblk
+
+    - name: build rook
+      working-directory: ${{env.rook-working-directory}}
+      run: tests/scripts/github-action-helper.sh build_rook
+
+    - name: deploy rook-ceph on primary cluster
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        BLOCK=$(sudo lsblk|awk '/14G/ {print $1}'| head -1)
+        cd cluster/examples/kubernetes/ceph/
+        yq w -i operator.yaml data.CSI_ENABLE_VOLUME_REPLICATION --style=double true
+        # TODO: remove hardcoded image
+        yq w -i operator.yaml data.CSI_VOLUME_REPLICATION_IMAGE --style=double quay.io/csiaddons/volumereplication-operator:test1098
+        kubectl create --context=primary -f crds.yaml -f common.yaml -f operator.yaml
+        yq w -i -d1 cluster-test.yaml spec.dashboard.enabled false
+        yq w -i -d1 cluster-test.yaml spec.storage.useAllDevices false
+        yq w -i -d1 cluster-test.yaml spec.storage.deviceFilter ${BLOCK}1
+        yq w -i -d1 cluster-test.yaml spec.cephVersion.image ceph/ceph:v15
+        kubectl create --context=primary -f cluster-test.yaml -f rbdmirror.yaml -f filesystem-mirror.yaml -f toolbox.yaml
+
+    - name: deploy rook-ceph on secondary cluster
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        BLOCK=$(sudo lsblk|awk '/14G/ {print $1}'| head -1)
+        cd cluster/examples/kubernetes/ceph/
+        yq w -i operator.yaml data.CSI_ENABLE_VOLUME_REPLICATION --style=double true
+        yq w -i operator.yaml data.CSI_VOLUME_REPLICATION_IMAGE --style=double quay.io/csiaddons/volumereplication-operator:test1098
+        kubectl create --context=secondary -f crds.yaml -f common.yaml -f operator.yaml
+        yq w -i -d1 cluster-test.yaml spec.dashboard.enabled false
+        yq w -i -d1 cluster-test.yaml spec.storage.useAllDevices false
+        yq w -i -d1 cluster-test.yaml spec.storage.deviceFilter ${BLOCK}2
+        yq w -i -d1 cluster-test.yaml spec.cephVersion.image ceph/ceph:v15
+        kubectl create --context=secondary -f cluster-test.yaml -f rbdmirror.yaml -f filesystem-mirror.yaml -f toolbox.yaml
+
+    - name: wait for primary cluster to be ready
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        # wait for ceph health to be HEALTH OK
+        timeout 180 sh -c 'until [ "$(kubectl --context=primary get deployment rook-ceph-tools -n rook-ceph   -o jsonpath='{.status.readyReplicas}'|grep -c "1")" -eq 1 ]; do echo "waiting for toolbox to be ready on primary cluster" && sleep 1; done'
+        kubectl -n rook-ceph --context=primary get pods
+        timeout 180 sh -c 'until [ "$(kubectl --context=primary -n rook-ceph exec $(kubectl --context=primary -n rook-ceph get pods -l  app=rook-ceph-tools -o jsonpath="{.items[0].metadata.name}") -- ceph health | grep -c "HEALTH_OK")" -eq 1 ]; do echo "waiting for ceph health to be ok on primary cluster $(kubectl --context=primary -n rook-ceph exec $(kubectl --context=primary -n rook-ceph get pods -l  app=rook-ceph-tools -o jsonpath="{.items[0].metadata.name}") -- ceph health)" && sleep 1; done'
+        kubectl -n rook-ceph --context=primary get pods
+
+    - name: wait for ceph secondary cluster to be ready
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        # wait for ceph health to be HEALTH OK
+        timeout 180 sh -c 'until [ "$(kubectl --context=secondary get deployment rook-ceph-tools -n rook-ceph   -o jsonpath='{.status.readyReplicas}'|grep -c "1")" -eq 1 ]; do echo "waiting for toolbox to be ready on primary cluster" && sleep 1; done'
+        timeout 180 sh -c 'until [ "$(kubectl --context=secondary -n rook-ceph exec $(kubectl --context=secondary -n rook-ceph get pods -l  app=rook-ceph-tools -o jsonpath="{.items[0].metadata.name}") -- ceph health | grep -c "HEALTH_OK")" -eq 1 ]; do echo "waiting for ceph health to be ok on secondary cluster" && sleep 1; done'
+        kubectl -n rook-ceph --context=secondary get pods
+
+    - name: create replicated mirrored pool on cluster 1
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        cd cluster/examples/kubernetes/ceph/
+        yq w -i pool-test.yaml spec.mirroring.enabled true
+        yq w -i pool-test.yaml spec.mirroring.mode image
+        kubectl --context=primary create -f pool-test.yaml
+        timeout 180 sh -c 'until [ "$(kubectl -n rook-ceph --context=primary get cephblockpool replicapool -o jsonpath='{.status.phase}'|grep -c "Ready")" -eq 1 ]; do echo "waiting for pool to created" && sleep 1; done'
+
+    - name: create replicated mirrored pool on cluster 2
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        cd cluster/examples/kubernetes/ceph/
+        timeout 180 sh -c 'until [ "$(kubectl --context=secondary get deployment rook-ceph-tools -n rook-ceph   -o jsonpath='{.status.readyReplicas}'|grep -c "1")" -eq 1 ]; do echo "waiting for toolbox to be ready on secondary cluster" && sleep 1; done'
+        yq w -i pool-test.yaml metadata.namespace rook-ceph
+        kubectl --context=secondary create -f pool-test.yaml
+        timeout 180 sh -c 'until [ "$(kubectl -n rook-ceph --context=secondary get cephblockpool replicapool -o jsonpath='{.status.phase}'|grep -c "Ready")" -eq 1 ]; do echo "waiting for pool to created" && sleep 1; done'
+        kubectl -n rook-ceph --context=secondary get pods
+
+    - name: create image in the pool
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        kubectl exec -n rook-ceph --context=primary deploy/rook-ceph-tools -ti -- rbd -p replicapool create test -s 1G
+        kubectl exec -n rook-ceph --context=primary deploy/rook-ceph-tools -t -- rbd mirror image enable replicapool/test snapshot
+        kubectl exec -n rook-ceph --context=primary deploy/rook-ceph-tools -t -- rbd -p replicapool info test
+
+    - name: copy peer secret into the other cluster
+      working-directory: ${{env.rook-working-directory}}
+      run: |
+        kubectl -n rook-ceph --context=primary get secret pool-peer-token-replicapool -o yaml |\
+        sed 's/namespace: rook-ceph/namespace: rook-ceph/g; s/name: pool-peer-token-replicapool/name: pool-peer-token-replicapool-config/g' |\
+        kubectl create --namespace=rook-ceph --context=secondary -f -
+
+    - name: add peer secret to the other cluster
+      run: |
+        kubectl -n rook-ceph --context=secondary patch cephrbdmirror my-rbd-mirror --type merge -p '{"spec":{"peers": {"secretNames": ["pool-peer-token-replicapool-config"]}}}'
+
+    - name: verify image has been mirrored
+      run: |
+        # let's wait a bit for the image to be present
+        timeout 120 sh -c 'until [ "$(kubectl exec -n rook-ceph --context=secondary deploy/rook-ceph-tools -t -- rbd -p replicapool ls|grep -c test)" -eq 1 ]; do echo "waiting for image to be mirrored" && sleep 1; done'
+
+    - name: display cephblockpool and image status
+      run: |
+        timeout 80 sh -c 'until [ "$(kubectl -n rook-ceph --context=secondary get cephblockpool replicapool -o jsonpath='{.status.mirroringStatus.summary.daemon_health}'|grep -c OK)" -eq 1 ]; do echo "waiting for mirroring status to be updated" && sleep 1; done'
+        kubectl -n rook-ceph --context=secondary get cephblockpool -o yaml
+        kubectl exec -n rook-ceph --context=primary deploy/rook-ceph-tools -t -- rbd -p replicapool info test
+
+    - name: create storage class on primary cluster
+      run: |
+        cd /tests/scripts
+        yq w -i storage_class.yaml metadata.name rook-ceph-block
+        kubectl -n rook-ceph --context=primary apply -f storage-class.yaml
+
+    - name: create PVC on primary cluster
+      run: |
+        cd /tests/scripts
+        yq w -i pvc.yaml metadata.name rbd-pvc
+        yq w -i pvc.yaml spec.storageClassName rook-ceph-block
+        kubectl -n rook-ceph --context=primary apply -f pvc.yaml
+
+    - name: create sample deployment on primary cluster
+      run: |
+        cd /tests/scripts
+        kubectl -n rook-ceph --context=primary apply -f sample-deployment.yaml
+        timeout 60 sh -c 'until [ "$(kubectl --context=primary get deployment csi-rbd-demo-pod  -o jsonpath='{.status.readyReplicas}'|grep -c "2")" -eq 1 ]; do echo "waiting for sample deployment to be ready" && sleep 1; done'

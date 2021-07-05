@@ -1,0 +1,24 @@
+kind: Deployment
+metadata:
+  name: csi-rbd-demo-pod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+        - name: web-server
+          image: docker.io/library/nginx:latest
+          volumeMounts:
+            - name: mypvc
+              mountPath: /var/lib/www/html
+      volumes:
+        - name: mypvc
+          persistentVolumeClaim:
+            claimName: rbd-pvc
+            readOnly: false
